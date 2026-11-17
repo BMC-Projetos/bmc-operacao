@@ -1,0 +1,10 @@
+[Unit]
+Description=Limpa camadas sem uso do registro interno da BMC
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/bin/docker exec registro bin/registry garbage-collect --delete-untagged /etc/docker/registry/config.yml

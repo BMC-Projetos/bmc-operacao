@@ -1,8 +1,8 @@
 # /etc/bmc-publicador/servicos/controladoria.conf  (root:root 0640)
 # Um arquivo por serviço e ambiente. O nome do arquivo (sem .conf) é o <id>.
 SERVICO=controladoria                # pasta servicos/<SERVICO>/ no bmc-operacao
-AMBIENTE=producao                    # producao: digest do Git | homologacao: segue a tag
-IMAGEM_REPO=ghcr.io/ORG/controladoria   # minúsculas; só imagens deste repositório são aceitas
+AMBIENTE=producao                    # digest aprovado no bmc-operacao
+IMAGEM_REPO=registro-hmg.bmchyundai.com.br:5443/controladoria   # registro interno na HMG-01
 
 COMPOSE_DIR=/srv/bmc/controladoria   # compose.yml (TI) + .env (publicador)
 COMPOSE_SERVICO=app                  # nome do serviço dentro do compose.yml

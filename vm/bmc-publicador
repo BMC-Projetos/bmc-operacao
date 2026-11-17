@@ -2,9 +2,14 @@
 # bmc-publicador: publica imagens dos portais da BMC por digest, com lock,
 # health check, rollback automático e registro de cada publicação.
 #
-# Roda na VM (BMC-AGENT-01 em produção; homologação onde a TI decidir).
-# Só faz conexões de SAÍDA: api.github.com (estado desejado + status),
-# ghcr.io (imagens) e o Pushgateway da TICWay (métricas).
+# Dois papéis (por serviço, em /etc/bmc-publicador/servicos/<id>.conf):
+#  - HOMOLOGAÇÃO, MODO=build (BMC-HMG-01): acompanha a main do repo do
+#    portal no GitHub, MONTA a imagem de cada commit que passou no CI, guarda
+#    no registro interno da HMG-01, publica na homologação e, se ficou
+#    saudável, abre/atualiza o PR de promoção no bmc-operacao.
+#  - PRODUÇÃO (BMC-AGENT-01): lê no bmc-operacao o digest aprovado e baixa a
+#    imagem do registro interno (rede local), com senha.
+# Só faz conexões de SAÍDA: api.github.com, o registro e o Pushgateway.
 #
 # Comandos (como root):
 #   bmc-publicador sincronizar            # o timer chama: aplica o que mudou
@@ -13,18 +18,21 @@
 #   bmc-publicador aplicar <id> <digest>  # publicação manual (TI)
 #   bmc-publicador reverter <id>          # volta ao anterior E pausa o serviço
 #   bmc-publicador pausar <id> | retomar <id>
+#   bmc-publicador adotar <id>            # 1ª vez: o que está rodando vira "atual"
 #   bmc-publicador verificar              # testa config, segredos e acesso
 #
 # <id> = nome do arquivo em /etc/bmc-publicador/servicos/<id>.conf
 # <digest> = sha256:<64 hex>  (o repositório da imagem vem da config do serviço)
 #
-# Segurança: do GitHub só vem um DADO (o digest). Nada lido do Git é
-# executado nem usado com `source`; compose e configs são locais (TI).
+# Segurança: na PRODUÇÃO, do GitHub só vem um DADO (o digest). Nada lido do Git é
+# executado nem usado com `source`; compose e configs são locais (TI). Na
+# HOMOLOGAÇÃO o código do portal é MONTADO (docker build, isolado) só depois
+# de passar no CI do GitHub.
 set -euo pipefail
 export LC_ALL=C
 umask 027
 
-VERSAO=1.1.0
+VERSAO=2.0.0
 ETC=/etc/bmc-publicador
 ESTADO=/var/lib/bmc-publicador
 LOGDIR=/var/log/bmc-publicador
@@ -45,7 +53,11 @@ carrega_geral() {
   : "${PUSHGATEWAY_URL:=}" "${DISCO_MIN_LIVRE_MB:=3072}" "${MANTER_IMAGENS:=3}"
   : "${GHCR_USUARIO:=}" "${GHCR_TOKEN_ARQUIVO:=}"
   : "${GITHUB_APP_ID:=}" "${GITHUB_APP_INSTALACAO:=}" "${GITHUB_APP_CHAVE:=}"
-  export DOCKER_CONFIG="$ESTADO/.docker"   # credencial do GHCR fora do ~root
+  # App que abre o PR de promoção (só na HMG-01; instalado só no bmc-operacao)
+  : "${PROMOTOR_APP_ID:=}" "${PROMOTOR_APP_INSTALACAO:=}" "${PROMOTOR_APP_CHAVE:=}"
+  # Registro interno: nome que a PRODUÇÃO usa para baixar (vai no PR) e login
+  : "${REGISTRO_PUBLICO:=}" "${REGISTRO_USUARIO:=}" "${REGISTRO_SENHA_ARQUIVO:=}"
+  export DOCKER_CONFIG="$ESTADO/.docker"   # credenciais de registro fora do ~root
   mkdir -p "$ESTADO" "$LOGDIR" "$RUNDIR" "$DOCKER_CONFIG"
   chmod 700 "$DOCKER_CONFIG"
 }
@@ -56,13 +68,16 @@ carrega_servico() {
   local f="$ETC/servicos/$ID.conf"
   [ -r "$f" ] || fail "serviço não cadastrado: $ID ($f)"
   unset SERVICO AMBIENTE IMAGEM_REPO COMPOSE_DIR COMPOSE_SERVICO CONTAINER \
-        HEALTH_URL HEALTH_TIMEOUT SMOKE LOCK_EXTRA TAG_HOMOLOGACAO
+        HEALTH_URL HEALTH_TIMEOUT SMOKE LOCK_EXTRA TAG_HOMOLOGACAO \
+        MODO REPO_APP BRANCH_APP CHECK_CI FONTE_LOCAL PROMOVER
   # shellcheck disable=SC1090
   . "$f"
   : "${SERVICO:?}" "${AMBIENTE:?}" "${IMAGEM_REPO:?}" "${COMPOSE_DIR:?}" \
     "${COMPOSE_SERVICO:?}" "${CONTAINER:?}" "${HEALTH_URL:?}"
   : "${HEALTH_TIMEOUT:=120}" "${SMOKE:=}" "${LOCK_EXTRA:=}" "${TAG_HOMOLOGACAO:=homologacao}"
+  : "${MODO:=tag}" "${REPO_APP:=}" "${BRANCH_APP:=main}" "${CHECK_CI:=imagem}" "${FONTE_LOCAL:=}" "${PROMOVER:=nao}"
   case "$AMBIENTE" in producao|homologacao) ;; *) fail "AMBIENTE inválido: $AMBIENTE" ;; esac
+  case "$MODO" in tag|build) ;; *) fail "MODO inválido: $MODO" ;; esac
   [ -f "$COMPOSE_DIR/compose.yml" ] || fail "falta $COMPOSE_DIR/compose.yml"
   SD="$ESTADO/$ID"; mkdir -p "$SD"
 }
@@ -78,23 +93,34 @@ valida_ref() {   # $1 = repo@sha256:... ; tem que ser do repositório do serviç
 }
 
 # ---------------------------------------------------------------- GitHub App
-token_github() {   # token de instalação (validade 1 h); vazio se não houver App
-  [ -n "$GITHUB_APP_ID" ] && [ -n "$GITHUB_APP_INSTALACAO" ] && [ -r "$GITHUB_APP_CHAVE" ] || return 0
-  local agora h p s b64
+token_app() {   # token_app <app-id> <instalação> <chave.pem>: token de 1 h; vazio se faltar
+  local id="$1" inst="$2" chave="$3" agora h p s
+  [ -n "$id" ] && [ -n "$inst" ] && [ -r "$chave" ] || return 0
   b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
   agora=$(date +%s)
   h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
-  p=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((agora - 60)) $((agora + 540)) "$GITHUB_APP_ID" | b64)
-  s=$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$GITHUB_APP_CHAVE" -binary | b64)
+  p=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((agora - 60)) $((agora + 540)) "$id" | b64)
+  s=$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$chave" -binary | b64)
   curl -fsS --max-time 20 -X POST \
     -H "Authorization: Bearer $h.$p.$s" -H 'Accept: application/vnd.github+json' \
-    "https://api.github.com/app/installations/$GITHUB_APP_INSTALACAO/access_tokens" | jq -r '.token // empty'
+    "https://api.github.com/app/installations/$inst/access_tokens" | jq -r '.token // empty'
+}
+token_github()   { token_app "$GITHUB_APP_ID" "$GITHUB_APP_INSTALACAO" "$GITHUB_APP_CHAVE"; }
+token_promotor() { token_app "$PROMOTOR_APP_ID" "$PROMOTOR_APP_INSTALACAO" "$PROMOTOR_APP_CHAVE"; }
+
+api() {   # api <token> <método> <caminho completo após /repos/> [Accept] [corpo json via stdin]
+  local tok="$1" met="$2" cam="$3" acc="${4:-application/vnd.github+json}"
+  if [ "$met" = GET ]; then
+    curl -fsSL --max-time 120 -H "Authorization: Bearer $tok" -H "Accept: $acc" \
+      -H 'X-GitHub-Api-Version: 2022-11-28' "https://api.github.com/repos/$cam"
+  else
+    curl -fsS --max-time 30 -X "$met" -H "Authorization: Bearer $tok" -H "Accept: $acc" \
+      -H 'X-GitHub-Api-Version: 2022-11-28' --data @- "https://api.github.com/repos/$cam"
+  fi
 }
 
-gh_api() {   # gh_api <caminho> [Accept]
-  curl -fsS --max-time 20 -H "Authorization: Bearer $GH_TOKEN" \
-    -H "Accept: ${2:-application/vnd.github+json}" -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "https://api.github.com/repos/$REPO_OPERACAO/$1"
+gh_api() {   # gh_api <caminho no bmc-operacao> [Accept]
+  api "$GH_TOKEN" GET "$REPO_OPERACAO/$1" "${2:-}"
 }
 
 status_github() {   # status_github <estado> <descrição>; só produção e com commit
@@ -108,12 +134,20 @@ status_github() {   # status_github <estado> <descrição>; só produção e com
 }
 
 # ----------------------------------------------------------------- Docker
-login_ghcr() {
-  [ -n "${GHCR_LOGADO:-}" ] && return 0
-  case "${IMAGEM_REPO:-ghcr.io/}" in ghcr.io/*) ;; *) return 0 ;; esac   # outro registry: sem login do GHCR
-  [ -r "$GHCR_TOKEN_ARQUIVO" ] || fail "falta $GHCR_TOKEN_ARQUIVO"
-  docker login ghcr.io -u "$GHCR_USUARIO" --password-stdin <"$GHCR_TOKEN_ARQUIVO" >/dev/null
-  GHCR_LOGADO=1
+login_ghcr() {   # login no registro da imagem do serviço, se ele exigir
+  local host="${IMAGEM_REPO%%/*}"
+  [ "${LOGADO_EM:-}" = "$host" ] && return 0
+  case "$host" in
+    ghcr.io)
+      [ -r "$GHCR_TOKEN_ARQUIVO" ] || fail "falta $GHCR_TOKEN_ARQUIVO"
+      docker login ghcr.io -u "$GHCR_USUARIO" --password-stdin <"$GHCR_TOKEN_ARQUIVO" >/dev/null ;;
+    127.0.0.1:*|localhost:*) ;;   # registro local da própria VM: sem senha
+    *)
+      if [ -n "$REGISTRO_USUARIO" ] && [ -r "$REGISTRO_SENHA_ARQUIVO" ]; then
+        docker login "$host" -u "$REGISTRO_USUARIO" --password-stdin <"$REGISTRO_SENHA_ARQUIVO" >/dev/null
+      fi ;;
+  esac
+  LOGADO_EM="$host"
 }
 
 compose() { docker compose --project-directory "$COMPOSE_DIR" -f "$COMPOSE_DIR/compose.yml" "$@"; }
@@ -276,6 +310,118 @@ desejado_homologacao() {   # resolve a tag de homologação para digest
   printf '%s\n' "${ref##*@}"
 }
 
+# ------------------------------------------------- MODO=build (homologação)
+# Acompanha a branch do repo do portal; só monta commit cujo check do CI
+# ($CHECK_CI, o job "imagem") terminou com sucesso; no máximo 1 build por
+# ciclo (carga baixa na VM). FONTE_LOCAL=<pasta git> troca o GitHub por um
+# repositório local (testes, ou se o GitHub estiver fora).
+commit_da_branch() {   # imprime o sha da ponta da branch
+  if [ -n "$FONTE_LOCAL" ]; then git -C "$FONTE_LOCAL" rev-parse "$BRANCH_APP"
+  else api "$APP_TOKEN" GET "$REPO_APP/commits/$BRANCH_APP" application/vnd.github.sha; fi
+}
+
+titulo_do_commit() {   # primeira linha da mensagem do commit (para o PR)
+  if [ -n "$FONTE_LOCAL" ]; then git -C "$FONTE_LOCAL" log -1 --format=%s "$1"
+  else api "$APP_TOKEN" GET "$REPO_APP/commits/$1" | jq -r '.commit.message | split("\n")[0]'; fi
+}
+
+ci_do_commit() {   # success | failure | pendente | sem-ci
+  [ -n "$FONTE_LOCAL" ] && { echo sem-ci; return; }
+  api "$APP_TOKEN" GET "$REPO_APP/commits/$1/check-runs?check_name=$CHECK_CI&filter=latest" |
+    jq -r '[.check_runs[]] | if length==0 then "pendente"
+           elif (map(.status)|any(.!="completed")) then "pendente"
+           elif (map(.conclusion)|all(.=="success")) then "success" else "failure" end'
+}
+
+construir() {   # construir <sha>: monta, envia ao registro local e define DIG
+  local sha="$1" ctx t0 ref
+  ctx=$(mktemp -d "$ESTADO/build.XXXXXX"); t0=$(date +%s)
+  if [ -n "$FONTE_LOCAL" ]; then git -C "$FONTE_LOCAL" archive "$sha" | tar -x -C "$ctx"
+  else api "$APP_TOKEN" GET "$REPO_APP/tarball/$sha" | tar -xz -C "$ctx" --strip-components=1; fi
+  [ -f "$ctx/Dockerfile" ] || { log "commit ${sha:0:7} sem Dockerfile"; rm -rf "$ctx"; return 1; }
+  touch "$RUNDIR/construiu"
+  log "montando ${sha:0:7} (prioridade mínima)…"
+  if nice -n 19 ionice -c3 docker build -q \
+       --label "org.opencontainers.image.revision=$sha" \
+       --label "org.opencontainers.image.source=${REPO_APP:-$FONTE_LOCAL}" \
+       -t "$IMAGEM_REPO:sha-$sha" "$ctx" >"$SD/build.log" 2>&1 &&
+     docker push -q "$IMAGEM_REPO:sha-$sha" >>"$SD/build.log" 2>&1; then
+    ref=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGEM_REPO:sha-$sha" | grep -F "$IMAGEM_REPO@" | head -n1)
+    rm -rf "$ctx"
+    valida_ref "$ref" || { log "digest não encontrado após o push"; return 1; }
+    DIG="${ref##*@}"
+    printf '%s %s %s\n' "$sha" "$DIG" "$(date +%FT%T)" >>"$SD/construidos"
+    log "imagem ${DIG:7:12} pronta em $(( $(date +%s) - t0 ))s"
+    limpa_registro
+    return 0
+  fi
+  rm -rf "$ctx"
+  log "build de ${sha:0:7} falhou (detalhes em $SD/build.log)"
+  return 1
+}
+
+desejado_build() {   # define COMMIT_APP e DIG; retorna 1 se nada a publicar agora
+  local sha ci
+  sha=$(commit_da_branch 2>/dev/null) || { log "não li a branch $BRANCH_APP"; return 1; }
+  [[ "$sha" =~ ^[a-f0-9]{40}$ ]] || { log "sha inválido da branch: $sha"; return 1; }
+  COMMIT_APP="$sha"
+  DIG=$(awk -v s="$sha" '$1==s{print $2}' "$SD/construidos" 2>/dev/null | tail -n1)
+  [ -n "$DIG" ] && return 0
+  grep -qxF "$sha" "$SD/reprovados" 2>/dev/null && return 1
+  ci=$(ci_do_commit "$sha" 2>/dev/null || echo pendente)
+  case "$ci" in
+    success|sem-ci) ;;
+    pendente) log "CI de ${sha:0:7} ainda não terminou"; return 1 ;;
+    *) log "CI de ${sha:0:7} reprovado: não monto"; echo "$sha" >>"$SD/reprovados"; return 1 ;;
+  esac
+  [ -e "$RUNDIR/construiu" ] && { log "build de ${sha:0:7} fica para o próximo ciclo (1 por ciclo)"; return 1; }
+  espaco_ok || return 1
+  construir "$sha" || { echo "$sha" >>"$SD/reprovados"; return 1; }
+}
+
+promover() {   # promover <sha> <digest>: abre/atualiza o PR de produção no bmc-operacao
+  local sha="$1" dig="$2" tok rep="$REPO_OPERACAO" br="promover/$SERVICO" img main fsha atual_main titulo corpo n conteudo
+  [ "$PROMOVER" = sim ] || return 0
+  [ -n "$REGISTRO_PUBLICO" ] || { log "REGISTRO_PUBLICO vazio: PR não aberto"; return 0; }
+  img="$REGISTRO_PUBLICO/${IMAGEM_REPO##*/}@$dig"
+  tok=$(token_promotor 2>/dev/null || true)
+  [ -n "$tok" ] || { log "sem o App bmc-promotor configurado: PR de promoção não aberto"; return 0; }
+  atual_main=$(api "$tok" GET "$rep/contents/servicos/$SERVICO/producao.env?ref=$BRANCH_OPERACAO" application/vnd.github.raw+json 2>/dev/null | grep -E '^IMAGEM=' | cut -d= -f2-)
+  [ "$atual_main" = "$img" ] && { log "produção já pede esta imagem: sem PR"; return 0; }
+  main=$(api "$tok" GET "$rep/git/ref/heads/$BRANCH_OPERACAO" | jq -r .object.sha) || return 0
+  if api "$tok" GET "$rep/git/ref/heads/$br" >/dev/null 2>&1; then
+    jq -nc --arg s "$main" '{sha:$s, force:true}' | api "$tok" PATCH "$rep/git/refs/heads/$br" >/dev/null
+  else
+    jq -nc --arg r "refs/heads/$br" --arg s "$main" '{ref:$r, sha:$s}' | api "$tok" POST "$rep/git/refs" >/dev/null
+  fi
+  fsha=$(api "$tok" GET "$rep/contents/servicos/$SERVICO/producao.env?ref=$br" 2>/dev/null | jq -r '.sha // empty')
+  titulo="$(titulo_do_commit "$sha" 2>/dev/null | cut -c1-80)"
+  conteudo=$(printf '# Estado desejado de %s em PRODUÇÃO. Não edite à mão: o publicador da\n# homologação abre este PR depois que a versão ficou saudável lá.\nIMAGEM=%s\nCOMMIT=%s\nORIGEM=%s\n' \
+    "$SERVICO" "$img" "$sha" "https://github.com/${REPO_APP:-local}/commit/$sha")
+  jq -nc --arg m "$SERVICO: produção → ${sha:0:7} ($titulo)" --arg c "$(printf '%s' "$conteudo" | base64 -w0)" \
+     --arg b "$br" --arg s "$fsha" '{message:$m, content:$c, branch:$b} + (if $s=="" then {} else {sha:$s} end)' |
+    api "$tok" PUT "$rep/contents/servicos/$SERVICO/producao.env" >/dev/null
+  corpo=$(printf '%s\n' \
+    "Promoção de **$SERVICO** para produção, já publicada e saudável na homologação." "" \
+    "| | |" "|---|---|" \
+    "| Commit | [\`${sha:0:7}\`](https://github.com/${REPO_APP:-local}/commit/$sha): $titulo |" \
+    "| Imagem | \`$img\` |" "" \
+    "**Antes de aprovar, testei na homologação:**" \
+    "- [ ] login e telas principais abrem" \
+    "- [ ] o que este commit mudou funciona com os dados da homologação" \
+    "- [ ] nada foi enviado de verdade (e-mail, WhatsApp, Teams)" "" \
+    "Mexeu em banco, permissões, envio de mensagens ou integrações? A TI também aprova e o plano de volta tem que estar descrito." "" \
+    "Depois do merge, a produção atualiza em até ~2 min e o status \`publicacao/$SERVICO\` aparece no commit (verde = no ar; vermelho = voltou sozinha para a versão anterior).")
+  n=$(api "$tok" GET "$rep/pulls?state=open&head=${rep%%/*}:$br" | jq -r '.[0].number // empty')
+  if [ -n "$n" ]; then
+    jq -nc --arg t "$SERVICO → produção: ${sha:0:7} $titulo" --arg b "$corpo" '{title:$t, body:$b}' | api "$tok" PATCH "$rep/pulls/$n" >/dev/null
+  else
+    jq -nc --arg t "$SERVICO → produção: ${sha:0:7} $titulo" --arg b "$corpo" --arg h "$br" --arg base "$BRANCH_OPERACAO" \
+      '{title:$t, body:$b, head:$h, base:$base}' | api "$tok" POST "$rep/pulls" >/dev/null
+  fi
+  log "PR de promoção atualizado: $SERVICO → ${sha:0:7}"
+}
+
 sincroniza_um() {
   local dig
   [ -e "$SD/pausado" ] && { log "pausado (bmc-publicador retomar $ID)"; return 0; }
@@ -283,23 +429,46 @@ sincroniza_um() {
     [ -n "${COMMIT_OPERACAO:-}" ] || { log "sem acesso ao $REPO_OPERACAO: nada a fazer"; return 0; }
     dig=$(desejado_producao) || { log "não li o estado desejado"; return 0; }
     ORIGEM="github:$REPO_OPERACAO@${COMMIT_OPERACAO:0:12}"
+  elif [ "$MODO" = build ]; then
+    DIG=""; COMMIT_APP=""
+    desejado_build || return 0
+    dig="$DIG"; ORIGEM="build:${REPO_APP:-local}@${COMMIT_APP:0:12}"
   else
     dig=$(desejado_homologacao) || { log "não resolvi $IMAGEM_REPO:$TAG_HOMOLOGACAO"; return 0; }
     ORIGEM="tag:$TAG_HOMOLOGACAO"
   fi
   [ "$IMAGEM_REPO@$dig" = "$(le "$SD/atual")" ] && return 0
   [ "$IMAGEM_REPO@$dig" = "$(le "$SD/falhou")" ] && { log "${dig:7:12} já falhou; esperando digest novo"; return 0; }
-  aplicar "$dig" || true
+  if aplicar "$dig" && [ "$MODO" = build ]; then
+    promover "$COMMIT_APP" "$dig" || log "aviso: não consegui abrir o PR de promoção"
+  fi
+}
+
+limpa_registro() {   # no registro LOCAL, apaga manifestos além dos últimos 15 builds
+  local host="${IMAGEM_REPO%%/*}" nome="${IMAGEM_REPO#*/}" d
+  case "$host" in 127.0.0.1:*|localhost:*) ;; *) return 0 ;; esac
+  [ -s "$SD/construidos" ] || return 0
+  head -n -15 "$SD/construidos" | awk '{print $2}' | while read -r d; do
+    curl -fsS -o /dev/null -X DELETE "http://$host/v2/$nome/manifests/$d" 2>/dev/null && log "registro: removida ${d:7:12}"
+  done
+  tail -n 15 "$SD/construidos" >"$SD/construidos.tmp" && mv -f "$SD/construidos.tmp" "$SD/construidos"
 }
 
 cmd_sincronizar() {
-  local f prod=0
-  for f in "$ETC"/servicos/*.conf; do [ -e "$f" ] && grep -qE '^AMBIENTE=producao' "$f" && prod=1; done
-  GH_TOKEN=""; COMMIT_OPERACAO=""
-  if [ "$prod" = 1 ]; then
-    GH_TOKEN=$(token_github || true)
-    [ -n "$GH_TOKEN" ] && COMMIT_OPERACAO=$(gh_api "commits/$BRANCH_OPERACAO" 'application/vnd.github.sha' || true)
-    [[ "$COMMIT_OPERACAO" =~ ^[a-f0-9]{40}$ ]] || COMMIT_OPERACAO=""
+  local f prod=0 gh=0
+  for f in "$ETC"/servicos/*.conf; do
+    [ -e "$f" ] || continue
+    grep -qE '^AMBIENTE=producao' "$f" && prod=1 && gh=1
+    grep -qE '^MODO=build' "$f" && ! grep -qE '^FONTE_LOCAL=.' "$f" && gh=1
+  done
+  GH_TOKEN=""; COMMIT_OPERACAO=""; APP_TOKEN=""
+  rm -f "$RUNDIR/construiu"
+  if [ "$gh" = 1 ]; then
+    GH_TOKEN=$(token_github || true); APP_TOKEN="$GH_TOKEN"
+    if [ "$prod" = 1 ] && [ -n "$GH_TOKEN" ]; then
+      COMMIT_OPERACAO=$(gh_api "commits/$BRANCH_OPERACAO" 'application/vnd.github.sha' || true)
+      [[ "$COMMIT_OPERACAO" =~ ^[a-f0-9]{40}$ ]] || COMMIT_OPERACAO=""
+    fi
   fi
   for f in "$ETC"/servicos/*.conf; do
     [ -e "$f" ] || continue
@@ -330,7 +499,11 @@ cmd_verificar() {
   echo "versão $VERSAO"
   for c in docker curl jq openssl flock; do command -v "$c" >/dev/null && echo "ok  $c" || echo "FALTA $c"; done
   docker compose version >/dev/null 2>&1 && echo "ok  docker compose" || echo "FALTA docker compose v2"
-  login_ghcr && echo "ok  login ghcr.io como $GHCR_USUARIO"
+  if [ -n "$REGISTRO_USUARIO" ] && [ -n "$REGISTRO_PUBLICO" ]; then
+    IMAGEM_REPO="$REGISTRO_PUBLICO/x"; login_ghcr && echo "ok  login no registro ${REGISTRO_PUBLICO} como $REGISTRO_USUARIO"
+  fi
+  [ -n "$(token_promotor 2>/dev/null)" ] && echo "ok  App bmc-promotor (abre PR de promoção)" || echo "--  sem App bmc-promotor (PR de promoção não será aberto)"
+  curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:5000/v2/ 2>/dev/null && echo "ok  registro local 127.0.0.1:5000"
   t=$(token_github || true)
   if [ -n "$t" ]; then GH_TOKEN="$t"; echo "ok  GitHub App; main do $REPO_OPERACAO = $(gh_api "commits/$BRANCH_OPERACAO" 'application/vnd.github.sha' || echo '?')"
   else echo "--  sem GitHub App configurado (só homologação por tag funciona)"; fi
@@ -357,6 +530,11 @@ case "$acao" in
     touch "$SD/pausado"; ORIGEM="reverter:${SUDO_USER:-root}"; GH_TOKEN=""; COMMIT_OPERACAO=""
     log "pausado; para retomar depois do PR de reversão: bmc-publicador retomar $ID"
     com_lock aplicar "${ant##*@}" ;;
+  adotar)   # registra o que está rodando hoje como "atual" (1ª vez do serviço)
+    carrega_servico "${1:?id}"; set -- $CONTAINER
+    img=$(docker inspect -f '{{.Config.Image}}' "$1") || fail "container $1 não existe"
+    [ -n "$(le "$SD/atual")" ] && fail "$ID já tem versão atual: $(le "$SD/atual")"
+    grava "$SD/atual" "$img"; log "adotado: $img" ;;
   pausar)  carrega_servico "${1:?id}"; touch "$SD/pausado"; log "pausado" ;;
   retomar) carrega_servico "${1:?id}"; rm -f "$SD/pausado" "$SD/falhou"; log "retomado" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;

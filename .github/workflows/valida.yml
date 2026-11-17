@@ -1,6 +1,8 @@
 # Check obrigatório dos PRs do bmc-operacao.
-# Garante que um PR de promoção só troca o digest de um serviço conhecido,
-# que a imagem existe no GHCR e que ela foi construída do commit informado.
+# Um PR de promoção só pode trocar o digest de um serviço conhecido, com a
+# imagem vinda do registro interno da BMC (montada na HMG-01 a partir de um
+# commit que passou no CI). O registro é interno e o GitHub não o enxerga:
+# aqui se confere o FORMATO; quem baixa e confere o digest é a AGENT-01.
 name: valida
 
 on:
@@ -9,12 +11,13 @@ on:
 
 permissions:
   contents: read
-  packages: read          # ler os pacotes dos repos de app (dar acesso em Package settings)
 
 jobs:
   valida:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      REGISTRO: registro-hmg.bmchyundai.com.br:5443
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,44 +31,30 @@ jobs:
           set -euo pipefail
           git diff --name-only "$BASE"...HEAD > alterados.txt
           cat alterados.txt
-          # PR do bot só pode mexer em servicos/<serviço>/producao.env.
+          # PR do robô (bmc-promotor) só pode mexer em servicos/<serviço>/producao.env.
           # PR de pessoa (TI) pode mexer no resto, revisado pelo CODEOWNERS.
           if [[ "$AUTOR" == *"[bot]" ]]; then
             if grep -vE '^servicos/[a-z0-9-]+/producao\.env$' alterados.txt; then
-              echo "::error::o bot só pode alterar servicos/<serviço>/producao.env"; exit 1
+              echo "::error::o robô só pode alterar servicos/<serviço>/producao.env"; exit 1
             fi
           fi
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Formato, existência da imagem e commit de origem
-        env:
-          ORG: ${{ github.repository_owner }}
+      - name: Formato da imagem e do commit
         run: |
           set -euo pipefail
-          org="${ORG,,}"
           falhou=0
           for f in $(grep -E '^servicos/[a-z0-9-]+/producao\.env$' alterados.txt || true); do
             [ -f "$f" ] || { echo "$f removido: só a TI remove serviço"; continue; }
             svc="$(basename "$(dirname "$f")")"
             img="$(grep -E '^IMAGEM=' "$f" | tail -n1 | cut -d= -f2-)"
             com="$(grep -E '^COMMIT=' "$f" | tail -n1 | cut -d= -f2-)"
-            if ! [[ "$img" =~ ^ghcr\.io/${org}/${svc}@sha256:[a-f0-9]{64}$ ]]; then
-              echo "::error file=$f::IMAGEM tem que ser ghcr.io/${org}/${svc}@sha256:<64 hex> (veio: $img)"; falhou=1; continue
+            esc=$(printf '%s' "$REGISTRO" | sed 's/[.]/[.]/g')   # ponto literal
+            re="^${esc}/${svc}@sha256:[a-f0-9]{64}$"
+            if ! [[ "$img" =~ $re ]]; then
+              echo "::error file=$f::IMAGEM tem que ser $REGISTRO/$svc@sha256:<64 hex> (veio: $img)"; falhou=1; continue
             fi
             if ! [[ "$com" =~ ^[a-f0-9]{40}$ ]]; then
               echo "::error file=$f::COMMIT tem que ser o sha completo do repo $svc"; falhou=1; continue
-            fi
-            rev="$(docker buildx imagetools inspect "$img" --format '{{ json .Image }}' \
-                   | jq -r '(if has("config") then . else ([.[]] | map(select(has("config")))[0]) end)
-                            | .config.Labels["org.opencontainers.image.revision"] // empty' | head -n1)" || {
-              echo "::error file=$f::imagem não encontrada no GHCR: $img"; falhou=1; continue; }
-            if [ "$rev" != "$com" ]; then
-              echo "::error file=$f::a imagem foi construída do commit '$rev', não de '$com'"; falhou=1; continue
             fi
             echo "ok  $svc  ${img##*@}  commit $com"
             {
