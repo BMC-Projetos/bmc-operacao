@@ -1,15 +1,15 @@
 # bmc-operacao: quem aprova o quê. A última regra que casa vale.
 # Trocar ORG pelo nome da organização e conferir os nomes dos times.
 
-*                                           @ORG/ti-bmc
+*                                           @BMC-Projetos/ti-bmc
 
 # Produção de cada portal: o dono funcional aprova; a TI cobre ausências.
-/servicos/controladoria/producao.env        @ORG/controladoria-donos @ORG/ti-bmc
-/servicos/portal-tributario/producao.env    @ORG/tributario-donos @ORG/ti-bmc
-/servicos/agentes-fiscal/producao.env       @ORG/agentes-donos @ORG/ti-bmc
-/servicos/fechamento-fiscal/producao.env    @ORG/fechamento-donos @ORG/ti-bmc
-/servicos/intranet/producao.env             @ORG/intranet-donos @ORG/ti-bmc
-/servicos/rocky-agent/producao.env          @ORG/rocky-donos @ORG/ti-bmc
+/servicos/controladoria/producao.env        @BMC-Projetos/controladoria-donos @BMC-Projetos/ti-bmc
+/servicos/portal-tributario/producao.env    @BMC-Projetos/tributario-donos @BMC-Projetos/ti-bmc
+/servicos/agentes-fiscal/producao.env       @BMC-Projetos/agentes-donos @BMC-Projetos/ti-bmc
+/servicos/fechamento-fiscal/producao.env    @BMC-Projetos/fechamento-donos @BMC-Projetos/ti-bmc
+/servicos/intranet/producao.env             @BMC-Projetos/intranet-donos @BMC-Projetos/ti-bmc
+/servicos/rocky-agent/producao.env          @BMC-Projetos/rocky-donos @BMC-Projetos/ti-bmc
 
 # Validação e regras do repositório: só TI
-/.github/                                   @ORG/ti-bmc
+/.github/                                   @BMC-Projetos/ti-bmc
