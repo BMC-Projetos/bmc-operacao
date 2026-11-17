@@ -1,0 +1,23 @@
+[Unit]
+Description=BMC publicador (aplica imagens aprovadas por digest)
+Documentation=https://github.com/ORG/bmc-operacao
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bmc-publicador sincronizar
+# Carga baixa (regra TICWay): fica atrás de tudo e com teto de CPU.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=30%
+MemoryMax=256M
+# Uma publicação = pull + recriação + até 2 health checks + rollback
+TimeoutStartSec=15min
+RuntimeDirectory=bmc-publicador
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full

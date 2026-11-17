@@ -1,0 +1,13 @@
+# /etc/bmc-publicador/servicos/fechamento-hmg.conf: HOMOLOGAÇÃO na BMC-HMG-01.
+# Segue a tag "homologacao" que o CI move a cada merge na main.
+SERVICO=fechamento-fiscal
+AMBIENTE=homologacao
+IMAGEM_REPO=ghcr.io/ORG/fechamento-fiscal
+TAG_HOMOLOGACAO=homologacao
+COMPOSE_DIR=/srv/bmc/fechamento-hmg
+COMPOSE_SERVICO="app"
+CONTAINER="fechamento-fiscal-hmg"
+HEALTH_URL=http://127.0.0.1:15096/health
+HEALTH_TIMEOUT=120
+SMOKE=
+LOCK_EXTRA=

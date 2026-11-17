@@ -1,0 +1,13 @@
+# /etc/bmc-publicador/servicos/tributario-hmg.conf: HOMOLOGAÇÃO na BMC-HMG-01.
+# Segue a tag "homologacao" que o CI move a cada merge na main.
+SERVICO=portal-tributario
+AMBIENTE=homologacao
+IMAGEM_REPO=ghcr.io/ORG/portal-tributario
+TAG_HOMOLOGACAO=homologacao
+COMPOSE_DIR=/srv/bmc/tributario-hmg
+COMPOSE_SERVICO="app"
+CONTAINER="portaltributario-hmg"
+HEALTH_URL=http://127.0.0.1:18501/_stcore/health
+HEALTH_TIMEOUT=120
+SMOKE=
+LOCK_EXTRA=

@@ -1,0 +1,13 @@
+# /etc/bmc-publicador/servicos/rocky-hmg.conf: HOMOLOGAÇÃO na BMC-HMG-01.
+# Segue a tag "homologacao" que o CI move a cada merge na main.
+SERVICO=rocky-agent
+AMBIENTE=homologacao
+IMAGEM_REPO=ghcr.io/ORG/rocky-agent
+TAG_HOMOLOGACAO=homologacao
+COMPOSE_DIR=/srv/bmc/rocky-hmg
+COMPOSE_SERVICO="app"
+CONTAINER="rocky-agent-hmg"
+HEALTH_URL=http://127.0.0.1:13002/health
+HEALTH_TIMEOUT=120
+SMOKE=
+LOCK_EXTRA=

@@ -1,0 +1,13 @@
+# /etc/bmc-publicador/servicos/controladoria-hmg.conf: HOMOLOGAÇÃO na BMC-HMG-01.
+# Segue a tag "homologacao" que o CI move a cada merge na main.
+SERVICO=controladoria
+AMBIENTE=homologacao
+IMAGEM_REPO=ghcr.io/ORG/controladoria
+TAG_HOMOLOGACAO=homologacao
+COMPOSE_DIR=/srv/bmc/controladoria-hmg
+COMPOSE_SERVICO="app"
+CONTAINER="conciliacao-bmc-hmg"
+HEALTH_URL=http://127.0.0.1:13000/
+HEALTH_TIMEOUT=120
+SMOKE=/etc/bmc-publicador/smoke/controladoria.sh
+LOCK_EXTRA=

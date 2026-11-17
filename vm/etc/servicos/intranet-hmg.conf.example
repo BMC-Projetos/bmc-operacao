@@ -1,0 +1,13 @@
+# /etc/bmc-publicador/servicos/intranet-hmg.conf: HOMOLOGAÇÃO na BMC-HMG-01.
+# Segue a tag "homologacao" que o CI move a cada merge na main.
+SERVICO=intranet
+AMBIENTE=homologacao
+IMAGEM_REPO=ghcr.io/ORG/intranet
+TAG_HOMOLOGACAO=homologacao
+COMPOSE_DIR=/srv/bmc/intranet-hmg
+COMPOSE_SERVICO="app"
+CONTAINER="bmc-intranet-hmg"
+HEALTH_URL=http://127.0.0.1:13003/health
+HEALTH_TIMEOUT=120
+SMOKE=
+LOCK_EXTRA=

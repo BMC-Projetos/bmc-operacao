@@ -1,0 +1,60 @@
+# /srv/bmc/agentes-hmg/compose.yml: HOMOLOGAÇÃO (2026-11-17). Ver ../_comum.txt.
+# Painel e webhook na mesma imagem; dados e prompts compartilhados (:z).
+# /tributario = cópia congelada da pasta antiga do Portal Tributário (como
+# em produção). Sem o compartilhamento SMB de XML: pasta vazia.
+name: agentes-hmg
+x-agentes: &agentes
+  image: ${IMAGEM:-bmc/agentes-fiscal:hmg-20261117}
+  restart: unless-stopped
+  init: true
+  oom_score_adj: 900
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  volumes:
+    - /srv/bmc/agentes-hmg/prompts:/app/prompts:z
+    - /srv/bmc/agentes-hmg/dados:/app/dados:z
+    - /srv/bmc/tributario-legado:/tributario:ro,z
+    - /srv/bmc/agentes-hmg/xml_vendas_vazio:/mnt/xml_vendas:ro,z
+  extra_hosts:
+    - "smtp.office365.com=127.0.0.1"
+    - "smtp.office365.com=::1"
+    - "smtp-mail.outlook.com=127.0.0.1"
+    - "smtp-mail.outlook.com=::1"
+    - "smtp.gmail.com=127.0.0.1"
+    - "smtp.gmail.com=::1"
+    - "graph.microsoft.com=127.0.0.1"
+    - "graph.microsoft.com=::1"
+    - "api.twilio.com=127.0.0.1"
+    - "api.twilio.com=::1"
+    - "api.z-api.io=127.0.0.1"
+    - "api.z-api.io=::1"
+    - "metabase.bmchyundai.com.br:10.7.0.105"
+services:
+  painel:
+    <<: *agentes
+    container_name: agentes-fiscal-painel-hmg
+    env_file: [ /srv/bmc/agentes-hmg/app-painel.env ]
+    ports: [ "127.0.0.1:18503:8501" ]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+    deploy:
+      resources:
+        limits: { memory: 1g, cpus: "1.0" }
+  webhook:
+    <<: *agentes
+    container_name: agentes-fiscal-webhook-hmg
+    env_file: [ /srv/bmc/agentes-hmg/app-webhook.env ]
+    command: ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "1", "--threads", "4", "--timeout", "180", "--access-logfile", "-", "--error-logfile", "-", "webhook_server:app"]
+    ports: [ "127.0.0.1:15050:5050" ]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5050), 3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { memory: 384m, cpus: "0.5" }

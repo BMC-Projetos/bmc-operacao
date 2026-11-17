@@ -1,0 +1,38 @@
+# /srv/bmc/controladoria/compose.yml: Controladoria Inteligente, PRODUÇÃO
+# Mantido pela TI. O publicador só grava o .env ao lado (IMAGEM=...@sha256:...).
+# Para olhar à mão:  cd /srv/bmc/controladoria && docker compose ps
+#
+# Copiado do serviço conciliacao-bmc de /opt/agentes/docker-compose.yml
+# (inventário de 2026-11-16). Na virada, o serviço SAI daquele arquivo:
+# os dois não podem declarar o mesmo container_name.
+name: controladoria
+
+services:
+  app:
+    image: ${IMAGEM:?IMAGEM vazia: quem grava é o bmc-publicador}
+    container_name: conciliacao-bmc        # igual ao de hoje (Atlas, mapa e alertas)
+    restart: unless-stopped
+    init: true
+    user: node                             # uid 1000 = twadmin, dono dos binds
+    working_dir: /app/backend
+    ports:
+      - "127.0.0.1:3000:3000"              # Apache controladoriainteligente:8895 → aqui
+    env_file:
+      - /opt/agentes/envs/conciliacao-bmc.env   # o mesmo de hoje; nunca no Git
+    environment:
+      TZ: America/Sao_Paulo
+    volumes:
+      - /home/plataforma-conciliacao/source-20260806-163526/plataforma-nodejs-producao_20260806_163526/backend/uploads:/app/backend/uploads
+      - /home/plataforma-conciliacao/persistente/repositorio_insumos:/app/repositorio_insumos
+      - /home/plataforma-conciliacao/source-20260806-163526/plataforma-nodejs-producao_20260806_163526/backend/data:/app/backend/data
+    extra_hosts:
+      - "metabase.bmchyundai.com.br:10.7.0.105"
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+    # Uso: ~350 MB parado, pico de 1,2 GB em 14 dias (Prometheus, 16/11).
+    # Teto para um vazamento não derrubar os outros portais.
+    deploy:
+      resources:
+        limits:
+          memory: 2g

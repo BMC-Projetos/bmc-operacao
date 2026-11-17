@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# bmc-publicador: publica imagens dos portais da BMC por digest, com lock,
+# health check, rollback automático e registro de cada publicação.
+#
+# Roda na VM (BMC-AGENT-01 em produção; homologação onde a TI decidir).
+# Só faz conexões de SAÍDA: api.github.com (estado desejado + status),
+# ghcr.io (imagens) e o Pushgateway da TICWay (métricas).
+#
+# Comandos (como root):
+#   bmc-publicador sincronizar            # o timer chama: aplica o que mudou
+#   bmc-publicador status                 # o que está em execução por serviço
+#   bmc-publicador historico [N]          # últimas N publicações (padrão 20)
+#   bmc-publicador aplicar <id> <digest>  # publicação manual (TI)
+#   bmc-publicador reverter <id>          # volta ao anterior E pausa o serviço
+#   bmc-publicador pausar <id> | retomar <id>
+#   bmc-publicador verificar              # testa config, segredos e acesso
+#
+# <id> = nome do arquivo em /etc/bmc-publicador/servicos/<id>.conf
+# <digest> = sha256:<64 hex>  (o repositório da imagem vem da config do serviço)
+#
+# Segurança: do GitHub só vem um DADO (o digest). Nada lido do Git é
+# executado nem usado com `source`; compose e configs são locais (TI).
+set -euo pipefail
+export LC_ALL=C
+umask 027
+
+VERSAO=1.1.0
+ETC=/etc/bmc-publicador
+ESTADO=/var/lib/bmc-publicador
+LOGDIR=/var/log/bmc-publicador
+RUNDIR=/run/bmc-publicador
+REGISTRO="$LOGDIR/publicacoes.jsonl"
+
+# ----------------------------------------------------------------- utilidades
+log()  { printf '%s [%s] %s\n' "$(date '+%F %T')" "${ID:-publicador}" "$*" >&2; }
+fail() { log "ERRO: $*"; exit 1; }
+re_digest='^sha256:[a-f0-9]{64}$'
+
+carrega_geral() {
+  [ -r "$ETC/publicador.conf" ] || fail "falta $ETC/publicador.conf"
+  # arquivo local, root:root 0640: pode ser lido com source
+  # shellcheck disable=SC1091
+  . "$ETC/publicador.conf"
+  : "${REPO_OPERACAO:?REPO_OPERACAO vazio}" "${BRANCH_OPERACAO:=main}"
+  : "${PUSHGATEWAY_URL:=}" "${DISCO_MIN_LIVRE_MB:=3072}" "${MANTER_IMAGENS:=3}"
+  : "${GHCR_USUARIO:=}" "${GHCR_TOKEN_ARQUIVO:=}"
+  : "${GITHUB_APP_ID:=}" "${GITHUB_APP_INSTALACAO:=}" "${GITHUB_APP_CHAVE:=}"
+  export DOCKER_CONFIG="$ESTADO/.docker"   # credencial do GHCR fora do ~root
+  mkdir -p "$ESTADO" "$LOGDIR" "$RUNDIR" "$DOCKER_CONFIG"
+  chmod 700 "$DOCKER_CONFIG"
+}
+
+carrega_servico() {
+  ID="$1"
+  case "$ID" in (*[!a-z0-9-]*|'') fail "id de serviço inválido: $ID" ;; esac
+  local f="$ETC/servicos/$ID.conf"
+  [ -r "$f" ] || fail "serviço não cadastrado: $ID ($f)"
+  unset SERVICO AMBIENTE IMAGEM_REPO COMPOSE_DIR COMPOSE_SERVICO CONTAINER \
+        HEALTH_URL HEALTH_TIMEOUT SMOKE LOCK_EXTRA TAG_HOMOLOGACAO
+  # shellcheck disable=SC1090
+  . "$f"
+  : "${SERVICO:?}" "${AMBIENTE:?}" "${IMAGEM_REPO:?}" "${COMPOSE_DIR:?}" \
+    "${COMPOSE_SERVICO:?}" "${CONTAINER:?}" "${HEALTH_URL:?}"
+  : "${HEALTH_TIMEOUT:=120}" "${SMOKE:=}" "${LOCK_EXTRA:=}" "${TAG_HOMOLOGACAO:=homologacao}"
+  case "$AMBIENTE" in producao|homologacao) ;; *) fail "AMBIENTE inválido: $AMBIENTE" ;; esac
+  [ -f "$COMPOSE_DIR/compose.yml" ] || fail "falta $COMPOSE_DIR/compose.yml"
+  SD="$ESTADO/$ID"; mkdir -p "$SD"
+}
+
+curto(){ local x="${1##*sha256:}"; printf '%s' "${x:0:12}"; }
+le()   { [ -s "$1" ] && head -n1 "$1" || true; }
+grava(){ printf '%s\n' "$2" >"$1.tmp" && mv -f "$1.tmp" "$1"; }
+
+valida_ref() {   # $1 = repo@sha256:... ; tem que ser do repositório do serviço
+  local ref="$1" dig="${1##*@}"
+  [ "${ref%@*}" = "$IMAGEM_REPO" ] || return 1
+  [[ "$dig" =~ $re_digest ]] || return 1
+}
+
+# ---------------------------------------------------------------- GitHub App
+token_github() {   # token de instalação (validade 1 h); vazio se não houver App
+  [ -n "$GITHUB_APP_ID" ] && [ -n "$GITHUB_APP_INSTALACAO" ] && [ -r "$GITHUB_APP_CHAVE" ] || return 0
+  local agora h p s b64
+  b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+  agora=$(date +%s)
+  h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+  p=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((agora - 60)) $((agora + 540)) "$GITHUB_APP_ID" | b64)
+  s=$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$GITHUB_APP_CHAVE" -binary | b64)
+  curl -fsS --max-time 20 -X POST \
+    -H "Authorization: Bearer $h.$p.$s" -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/app/installations/$GITHUB_APP_INSTALACAO/access_tokens" | jq -r '.token // empty'
+}
+
+gh_api() {   # gh_api <caminho> [Accept]
+  curl -fsS --max-time 20 -H "Authorization: Bearer $GH_TOKEN" \
+    -H "Accept: ${2:-application/vnd.github+json}" -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "https://api.github.com/repos/$REPO_OPERACAO/$1"
+}
+
+status_github() {   # status_github <estado> <descrição>; só produção e com commit
+  [ -n "${GH_TOKEN:-}" ] && [ -n "${COMMIT_OPERACAO:-}" ] || return 0
+  jq -nc --arg s "$1" --arg d "${2:0:139}" --arg c "publicacao/$ID" \
+    '{state:$s, description:$d, context:$c}' |
+  curl -fsS --max-time 20 -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" \
+    -H 'Accept: application/vnd.github+json' --data @- \
+    "https://api.github.com/repos/$REPO_OPERACAO/statuses/$COMMIT_OPERACAO" ||
+    log "aviso: não consegui gravar o status no GitHub"
+}
+
+# ----------------------------------------------------------------- Docker
+login_ghcr() {
+  [ -n "${GHCR_LOGADO:-}" ] && return 0
+  case "${IMAGEM_REPO:-ghcr.io/}" in ghcr.io/*) ;; *) return 0 ;; esac   # outro registry: sem login do GHCR
+  [ -r "$GHCR_TOKEN_ARQUIVO" ] || fail "falta $GHCR_TOKEN_ARQUIVO"
+  docker login ghcr.io -u "$GHCR_USUARIO" --password-stdin <"$GHCR_TOKEN_ARQUIVO" >/dev/null
+  GHCR_LOGADO=1
+}
+
+compose() { docker compose --project-directory "$COMPOSE_DIR" -f "$COMPOSE_DIR/compose.yml" "$@"; }
+
+sobe() {   # sobe <ref completa>
+  printf 'IMAGEM=%s\n' "$1" >"$COMPOSE_DIR/.env.tmp" && mv -f "$COMPOSE_DIR/.env.tmp" "$COMPOSE_DIR/.env"
+  # COMPOSE_SERVICO pode ter mais de um serviço da mesma imagem
+  # (ex.: Agentes Fiscal: "painel webhook"), separados por espaço.
+  # shellcheck disable=SC2086
+  compose up -d --no-deps $COMPOSE_SERVICO >&2
+}
+
+estado_conjunto() {   # pior estado entre os containers de CONTAINER (lista)
+  local c e pior='running healthy'
+  for c in $CONTAINER; do
+    e=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}sem-healthcheck{{end}}' "$c" 2>/dev/null || echo 'ausente -')
+    case "$e" in
+      'running healthy'|'running sem-healthcheck') ;;
+      'running starting') pior="$e" ;;
+      *) echo "$c: $e"; return ;;
+    esac
+  done
+  echo "$pior"
+}
+
+saudavel() {   # espera os containers de pé + HEALTH_URL 2xx dentro do prazo
+  local fim=$(( $(date +%s) + HEALTH_TIMEOUT )) est
+  while [ "$(date +%s)" -lt "$fim" ]; do
+    est=$(estado_conjunto)
+    case "$est" in
+      'running healthy')
+        if curl -fsS -o /dev/null --max-time 5 "$HEALTH_URL"; then
+          if [ -z "$SMOKE" ] || timeout 120 "$SMOKE" "$HEALTH_URL" >&2; then return 0; fi
+          log "smoke test falhou"; return 1
+        fi ;;
+      *unhealthy|*exited*|*dead*) log "container: $est"; return 1 ;;
+    esac
+    sleep 3
+  done
+  log "health não respondeu em ${HEALTH_TIMEOUT}s (último estado: $est)"
+  return 1
+}
+
+espaco_ok() {
+  local livre
+  local raiz; raiz=$(docker info -f "{{.DockerRootDir}}" 2>/dev/null || echo /var/lib/docker)
+  livre=$(df -Pm "$raiz" 2>/dev/null | awk 'NR==2{print $4}')
+  [ -n "$livre" ] && [ "$livre" -ge "$DISCO_MIN_LIVRE_MB" ] && return 0
+  log "pouco espaço em ${raiz}: ${livre:-?} MB livres (mínimo $DISCO_MIN_LIVRE_MB)"
+  return 1
+}
+
+limpa_imagens() {
+  local manter ref
+  manter=$( { le "$SD/atual"; le "$SD/anterior"; tail -n "$MANTER_IMAGENS" "$SD/historico" 2>/dev/null; } | sort -u)
+  docker image ls --digests --format '{{.Repository}}@{{.Digest}}' "$IMAGEM_REPO" 2>/dev/null |
+  while read -r ref; do
+    case "$ref" in *'@<none>') continue ;; esac
+    grep -qxF "$ref" <<<"$manter" && continue
+    docker image rm "$ref" >/dev/null 2>&1 && log "imagem antiga removida: ${ref##*@}" || true
+  done
+}
+
+# ----------------------------------------------------------- registro/métricas
+registra() {   # registra <resultado> <digest> <anterior> <duração> <mensagem>
+  jq -nc --arg data "$(date --iso-8601=seconds)" --arg host "$(hostname -s)" \
+    --arg amb "$AMBIENTE" --arg svc "$ID" --arg dig "$2" --arg ant "$3" \
+    --arg com "${COMMIT_OPERACAO:-}" --arg ori "${ORIGEM:-manual}" \
+    --arg res "$1" --argjson dur "$4" --arg msg "$5" \
+    '{data:$data, host:$host, ambiente:$amb, servico:$svc, digest:$dig, anterior:$ant,
+      commit_operacao:$com, origem:$ori, resultado:$res, duracao_s:$dur, mensagem:$msg}' >>"$REGISTRO"
+  [ -n "$PUSHGATEWAY_URL" ] || return 0
+  local cod
+  case "$1" in ok) cod=1 ;; revertido) cod=0 ;; *) cod=-1 ;; esac
+  printf '# TYPE bmc_publicacao_resultado gauge\nbmc_publicacao_resultado{ambiente="%s",digest="%s"} %s\n# TYPE bmc_publicacao_timestamp_seconds gauge\nbmc_publicacao_timestamp_seconds{ambiente="%s"} %s\n# TYPE bmc_publicacao_duracao_seconds gauge\nbmc_publicacao_duracao_seconds{ambiente="%s"} %s\n' \
+    "$AMBIENTE" "${2#sha256:}" "$cod" "$AMBIENTE" "$(date +%s)" "$AMBIENTE" "$4" |
+    sed 's/digest="\([a-f0-9]\{12\}\)[a-f0-9]*"/digest="\1"/' |
+    curl -fsS --max-time 10 --data-binary @- \
+      "$PUSHGATEWAY_URL/metrics/job/bmc-publicador/host/$(hostname -s)/servico/$ID" >/dev/null ||
+    log "aviso: Pushgateway não respondeu"
+}
+
+# ------------------------------------------------------------------ aplicar
+aplicar() {   # aplicar <digest>  (serviço já carregado, lock já tomado)
+  local dig="$1" novo atual inicio dur msg res
+  [[ "$dig" =~ $re_digest ]] || fail "digest inválido: $dig"
+  novo="$IMAGEM_REPO@$dig"
+  atual=$(le "$SD/atual")
+  [ "$novo" != "$atual" ] || { log "já está em $dig"; return 0; }
+  inicio=$(date +%s)
+  log "publicando ${dig:0:19}… (anterior: ${atual##*@})"
+  status_github pending "publicando ${dig:7:12} em $AMBIENTE"
+
+  if ! espaco_ok; then
+    registra falhou "$dig" "${atual##*@}" 0 "pouco espaço em disco"   # temporário: tenta de novo no próximo ciclo
+    status_github failure "não publicado: pouco espaço em disco"; return 1
+  fi
+  login_ghcr
+  if ! docker pull -q "$novo" >/dev/null; then
+    registra falhou "$dig" "${atual##*@}" $(( $(date +%s) - inicio )) "pull falhou"   # temporário (rede/registry): tenta de novo
+    status_github failure "não publicado: imagem não baixou"; return 1
+  fi
+
+  if sobe "$novo" && saudavel; then
+    [ -n "$atual" ] && grava "$SD/anterior" "$atual"
+    grava "$SD/atual" "$novo"; rm -f "$SD/falhou"
+    printf '%s\n' "$novo" >>"$SD/historico"
+    dur=$(( $(date +%s) - inicio ))
+    registra ok "$dig" "${atual##*@}" "$dur" "publicado"
+    status_github success "publicado em $AMBIENTE em ${dur}s"
+    log "ok em ${dur}s"
+    limpa_imagens
+    return 0
+  fi
+
+  grava "$SD/falhou" "$novo"
+  if [ -z "$atual" ]; then
+    dur=$(( $(date +%s) - inicio ))
+    registra falhou "$dig" "" "$dur" "falhou e não há versão anterior registrada"
+    status_github failure "falhou; sem versão anterior para voltar (acione a TI)"
+    fail "falhou e não há anterior registrado: intervenção manual"
+  fi
+  log "falhou: voltando para ${atual##*@}"
+  if sobe "$atual" && saudavel; then msg="falhou; revertido para ${atual##*@}"; res=revertido
+  else msg="falhou E o rollback não ficou saudável"; res=falhou; fi
+  dur=$(( $(date +%s) - inicio ))
+  registra "$res" "$dig" "${atual##*@}" "$dur" "$msg"
+  status_github failure "$msg"
+  log "$msg"
+  return 1
+}
+
+com_lock() {   # com_lock <função> [args]: um por serviço; respeita o lock do ZIP
+  exec 8>"$RUNDIR/$ID.lock"
+  flock -n 8 || { log "outra publicação de $ID em andamento"; return 0; }
+  if [ -n "$LOCK_EXTRA" ] && [ -e "$LOCK_EXTRA" ]; then
+    exec 7<"$LOCK_EXTRA"
+    flock -n 7 || { log "instalador antigo em andamento ($LOCK_EXTRA)"; return 0; }
+  fi
+  "$@"
+}
+
+# --------------------------------------------------------- estado desejado
+desejado_producao() {   # imprime o digest pedido em servicos/<SERVICO>/producao.env
+  local txt img
+  txt=$(gh_api "contents/servicos/$SERVICO/producao.env?ref=$COMMIT_OPERACAO" 'application/vnd.github.raw+json') || return 1
+  img=$(printf '%s\n' "$txt" | grep -E '^IMAGEM=' | tail -n1 | cut -d= -f2- | tr -d '[:space:]"')
+  [ -n "$img" ] || return 1
+  valida_ref "$img" || { log "IMAGEM fora do padrão no Git: $img"; return 1; }
+  printf '%s\n' "${img##*@}"
+}
+
+desejado_homologacao() {   # resolve a tag de homologação para digest
+  local ref
+  login_ghcr
+  docker pull -q "$IMAGEM_REPO:$TAG_HOMOLOGACAO" >/dev/null || return 1
+  ref=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGEM_REPO:$TAG_HOMOLOGACAO" |
+        grep -F "$IMAGEM_REPO@" | head -n1)
+  valida_ref "$ref" || return 1
+  printf '%s\n' "${ref##*@}"
+}
+
+sincroniza_um() {
+  local dig
+  [ -e "$SD/pausado" ] && { log "pausado (bmc-publicador retomar $ID)"; return 0; }
+  if [ "$AMBIENTE" = producao ]; then
+    [ -n "${COMMIT_OPERACAO:-}" ] || { log "sem acesso ao $REPO_OPERACAO: nada a fazer"; return 0; }
+    dig=$(desejado_producao) || { log "não li o estado desejado"; return 0; }
+    ORIGEM="github:$REPO_OPERACAO@${COMMIT_OPERACAO:0:12}"
+  else
+    dig=$(desejado_homologacao) || { log "não resolvi $IMAGEM_REPO:$TAG_HOMOLOGACAO"; return 0; }
+    ORIGEM="tag:$TAG_HOMOLOGACAO"
+  fi
+  [ "$IMAGEM_REPO@$dig" = "$(le "$SD/atual")" ] && return 0
+  [ "$IMAGEM_REPO@$dig" = "$(le "$SD/falhou")" ] && { log "${dig:7:12} já falhou; esperando digest novo"; return 0; }
+  aplicar "$dig" || true
+}
+
+cmd_sincronizar() {
+  local f prod=0
+  for f in "$ETC"/servicos/*.conf; do [ -e "$f" ] && grep -qE '^AMBIENTE=producao' "$f" && prod=1; done
+  GH_TOKEN=""; COMMIT_OPERACAO=""
+  if [ "$prod" = 1 ]; then
+    GH_TOKEN=$(token_github || true)
+    [ -n "$GH_TOKEN" ] && COMMIT_OPERACAO=$(gh_api "commits/$BRANCH_OPERACAO" 'application/vnd.github.sha' || true)
+    [[ "$COMMIT_OPERACAO" =~ ^[a-f0-9]{40}$ ]] || COMMIT_OPERACAO=""
+  fi
+  for f in "$ETC"/servicos/*.conf; do
+    [ -e "$f" ] || continue
+    ( carrega_servico "$(basename "$f" .conf)"; com_lock sincroniza_um ) || true
+  done
+  if [ -n "$PUSHGATEWAY_URL" ]; then
+    printf '# TYPE bmc_publicador_sincronizacao_timestamp_seconds gauge\nbmc_publicador_sincronizacao_timestamp_seconds{versao="%s",github="%s"} %s\n' \
+      "$VERSAO" "$([ -n "$COMMIT_OPERACAO" ] && echo ok || echo sem-acesso)" "$(date +%s)" |
+      curl -fsS --max-time 10 --data-binary @- \
+        "$PUSHGATEWAY_URL/metrics/job/bmc-publicador/host/$(hostname -s)/servico/_agente" >/dev/null || true
+  fi
+}
+
+cmd_status() {
+  local f
+  printf '%-22s %-12s %-8s %-14s %-14s %s\n' SERVIÇO AMBIENTE PAUSADO ATUAL ANTERIOR FALHOU
+  for f in "$ETC"/servicos/*.conf; do
+    [ -e "$f" ] || continue
+    ( carrega_servico "$(basename "$f" .conf)"
+      a=$(le "$SD/atual"); b=$(le "$SD/anterior"); c=$(le "$SD/falhou")
+      printf '%-22s %-12s %-8s %-14s %-14s %s\n' "$ID" "$AMBIENTE" "$([ -e "$SD/pausado" ] && echo sim || echo não)" \
+        "$(curto "$a")" "$(curto "$b")" "$(curto "$c")" )
+  done
+}
+
+cmd_verificar() {
+  local t
+  echo "versão $VERSAO"
+  for c in docker curl jq openssl flock; do command -v "$c" >/dev/null && echo "ok  $c" || echo "FALTA $c"; done
+  docker compose version >/dev/null 2>&1 && echo "ok  docker compose" || echo "FALTA docker compose v2"
+  login_ghcr && echo "ok  login ghcr.io como $GHCR_USUARIO"
+  t=$(token_github || true)
+  if [ -n "$t" ]; then GH_TOKEN="$t"; echo "ok  GitHub App; main do $REPO_OPERACAO = $(gh_api "commits/$BRANCH_OPERACAO" 'application/vnd.github.sha' || echo '?')"
+  else echo "--  sem GitHub App configurado (só homologação por tag funciona)"; fi
+  [ -n "$PUSHGATEWAY_URL" ] && { curl -fsS --max-time 5 -o /dev/null "$PUSHGATEWAY_URL/-/ready" && echo "ok  Pushgateway" || echo "FALHA Pushgateway $PUSHGATEWAY_URL"; }
+  cmd_status
+}
+
+# ------------------------------------------------------------------- main
+[ "$(id -u)" -eq 0 ] || fail "rode como root"
+carrega_geral
+acao="${1:-}"; shift || true
+case "$acao" in
+  sincronizar) cmd_sincronizar ;;
+  status)      cmd_status ;;
+  historico)   tail -n "${1:-20}" "$REGISTRO" 2>/dev/null | jq -r '[.data,.ambiente,.servico,(.digest[7:19]),.resultado,(.duracao_s|tostring)+"s",.mensagem]|@tsv' ;;
+  verificar)   cmd_verificar ;;
+  aplicar)
+    [ $# -eq 2 ] || fail "uso: bmc-publicador aplicar <id> <sha256:...>"
+    carrega_servico "$1"; ORIGEM="manual:${SUDO_USER:-root}"; GH_TOKEN=""; COMMIT_OPERACAO=""
+    rm -f "$SD/falhou"; com_lock aplicar "$2" ;;
+  reverter)
+    [ $# -eq 1 ] || fail "uso: bmc-publicador reverter <id>"
+    carrega_servico "$1"; ant=$(le "$SD/anterior"); [ -n "$ant" ] || fail "não há versão anterior registrada"
+    touch "$SD/pausado"; ORIGEM="reverter:${SUDO_USER:-root}"; GH_TOKEN=""; COMMIT_OPERACAO=""
+    log "pausado; para retomar depois do PR de reversão: bmc-publicador retomar $ID"
+    com_lock aplicar "${ant##*@}" ;;
+  pausar)  carrega_servico "${1:?id}"; touch "$SD/pausado"; log "pausado" ;;
+  retomar) carrega_servico "${1:?id}"; rm -f "$SD/pausado" "$SD/falhou"; log "retomado" ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac

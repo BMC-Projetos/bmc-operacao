@@ -1,0 +1,6 @@
+# nunca: segredos
+*.pem
+*.key
+*.token
+app.env
+*.env.local

@@ -1,0 +1,25 @@
+# /etc/bmc-publicador/publicador.conf  (root:root 0640)
+# Copie para publicador.conf e ajuste. Sem segredo aqui: os segredos ficam em
+# arquivos separados em /etc/bmc-publicador/segredos/ (root:root 0600).
+
+# Repositório de operação (estado desejado de produção) e branch protegida
+REPO_OPERACAO=ORG/bmc-operacao
+BRANCH_OPERACAO=main
+
+# GitHub App "bmc-publicador": Contents read + Commit statuses write,
+# instalado SÓ no bmc-operacao. Em VM só de homologação pode ficar vazio.
+GITHUB_APP_ID=
+GITHUB_APP_INSTALACAO=
+GITHUB_APP_CHAVE=/etc/bmc-publicador/segredos/github-app.pem
+
+# Leitura do GHCR: conta de máquina + PAT classic só com read:packages
+GHCR_USUARIO=bmc-publicador-bot
+GHCR_TOKEN_ARQUIVO=/etc/bmc-publicador/segredos/ghcr.token
+
+# Métricas (o mesmo Pushgateway do cockpit-docker-stats). Vazio = não envia.
+PUSHGATEWAY_URL=http://10.0.0.120:9091
+
+# Não publica se /var/lib/docker tiver menos que isso livre
+DISCO_MIN_LIVRE_MB=3072
+# Imagens antigas mantidas por serviço, além da atual e da anterior
+MANTER_IMAGENS=3

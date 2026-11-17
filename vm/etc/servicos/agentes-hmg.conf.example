@@ -1,0 +1,13 @@
+# /etc/bmc-publicador/servicos/agentes-hmg.conf: HOMOLOGAÇÃO na BMC-HMG-01.
+# Segue a tag "homologacao" que o CI move a cada merge na main.
+SERVICO=agentes-fiscal
+AMBIENTE=homologacao
+IMAGEM_REPO=ghcr.io/ORG/agentes-fiscal
+TAG_HOMOLOGACAO=homologacao
+COMPOSE_DIR=/srv/bmc/agentes-hmg
+COMPOSE_SERVICO="painel webhook"
+CONTAINER="agentes-fiscal-painel-hmg agentes-fiscal-webhook-hmg"
+HEALTH_URL=http://127.0.0.1:18503/_stcore/health
+HEALTH_TIMEOUT=120
+SMOKE=
+LOCK_EXTRA=
