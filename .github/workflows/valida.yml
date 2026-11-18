@@ -8,6 +8,8 @@ name: valida
 on:
   pull_request:
     branches: [main]
+    # edited: marcar a caixa "Testei na homologação" roda o check de novo
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -37,6 +39,20 @@ jobs:
             if grep -vE '^servicos/[a-z0-9-]+/producao\.env$' alterados.txt; then
               echo "::error::o robô só pode alterar servicos/<serviço>/producao.env"; exit 1
             fi
+          fi
+
+      - name: Testado na homologação (obrigatório nos pedidos do robô)
+        env:
+          AUTOR: ${{ github.event.pull_request.user.login }}
+          CORPO: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          [[ "$AUTOR" == *"[bot]" ]] || { echo "pedido feito por pessoa: sem caixa obrigatória"; exit 0; }
+          if printf '%s\n' "$CORPO" | grep -qiE '^[[:space:]]*-[[:space:]]*\[x\][[:space:]]*\*\*Testei esta versão na homologação'; then
+            echo "ok: o dono marcou que testou na homologação"
+          else
+            echo "::error::Falta marcar a caixa 'Testei esta versão na homologação e está funcionando' na descrição do pedido. Teste na homologação, marque a caixa e este check fica verde sozinho."
+            exit 1
           fi
 
       - name: Formato da imagem e do commit
